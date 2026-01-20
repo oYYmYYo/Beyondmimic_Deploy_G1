@@ -52,7 +52,46 @@ def quat_rotate_inverse_np(q: np.ndarray, v: np.ndarray) -> np.ndarray:
         c = q_vec * dot_product * 2.0
     
     return a - b + c
-def subtract_frame_transforms_mujoco(pos_a, quat_a, pos_b, quat_b):
+import numpy as np
+
+def matrix_to_quaternion_simple(matrix):
+    """
+    简化的矩阵转四元数实现
+    """
+    matrix = np.array(matrix)
+    m00, m01, m02 = matrix[0]
+    m10, m11, m12 = matrix[1]
+    m20, m21, m22 = matrix[2]
+    
+    trace = m00 + m11 + m22
+    
+    if trace > 0:
+        s = 0.5 / np.sqrt(trace + 1.0)
+        w = 0.25 / s
+        x = (m21 - m12) * s
+        y = (m02 - m20) * s
+        z = (m10 - m01) * s
+    elif m00 > m11 and m00 > m22:
+        s = 2.0 * np.sqrt(1.0 + m00 - m11 - m22)
+        w = (m21 - m12) / s
+        x = 0.25 * s
+        y = (m01 + m10) / s
+        z = (m02 + m20) / s
+    elif m11 > m22:
+        s = 2.0 * np.sqrt(1.0 + m11 - m00 - m22)
+        w = (m02 - m20) / s
+        x = (m01 + m10) / s
+        y = 0.25 * s
+        z = (m12 + m21) / s
+    else:
+        s = 2.0 * np.sqrt(1.0 + m22 - m00 - m11)
+        w = (m10 - m01) / s
+        x = (m02 + m20) / s
+        y = (m12 + m21) / s
+        z = 0.25 * s
+    
+    return np.array([w, x, y, z])
+def subtract_frame_transforms_mujoco(pos_a, quat_a, pos_b, quat_b,init_to_world):
     """
     与IsaacLab中subtract_frame_transforms完全相同的实现（一维版本）
     计算从坐标系A到坐标系B的相对变换
@@ -75,7 +114,8 @@ def subtract_frame_transforms_mujoco(pos_a, quat_a, pos_b, quat_b):
     rel_pos = rotm_a.T @ (pos_b - pos_a)
     
     # 计算相对旋转: quat_B_to_A = quat_A^* ⊗ quat_B
-    rel_quat = quaternion_multiply(quaternion_conjugate(quat_a), quat_b)
+    rel_quat = quaternion_multiply(matrix_to_quaternion_simple(init_to_world), quat_b)
+    rel_quat = quaternion_multiply(quaternion_conjugate(quat_a), rel_quat)
     
     # 确保四元数归一化（与IsaacLab保持一致）
     rel_quat = rel_quat / np.linalg.norm(rel_quat)
@@ -185,7 +225,10 @@ joint_xml = [
 
 
 
-
+def yaw_quat(q):
+    w, x, y, z = q
+    yaw = np.arctan2(2 * (w * z + x * y), 1 - 2 * (y**2 + z**2))
+    return np.array([np.cos(yaw / 2), 0, 0, np.sin(yaw / 2)])
 
 if __name__ == "__main__":
     # get config file name from command line
@@ -254,6 +297,7 @@ if __name__ == "__main__":
     motionposcurrent = motionpos[timestep,9,:]
     motionquatcurrent = motionquat[timestep,9,:]
     target_dof_pos = joint_pos_array.copy()
+    d.qpos[2] = 0.8
     d.qpos[7:] = target_dof_pos
     # target_dof_pos = joint_pos_array_seq
     body_name = "torso_link"  # robot_ref_body_index=3 motion_ref_body_index=7
@@ -261,12 +305,29 @@ if __name__ == "__main__":
     body_id = mujoco.mj_name2id(m, mujoco.mjtObj.mjOBJ_BODY, body_name)
     if body_id == -1:
         raise ValueError(f"Body {body_name} not found in model")
-
+        
+    
     with mujoco.viewer.launch_passive(m, d) as viewer:
         # Close the viewer automatically after simulation_duration wall-seconds.
+        
         start = time.time()
         while viewer.is_running() and time.time() - start < simulation_duration:
             step_start = time.time()
+            if timestep < 2:
+
+                ref_motion_quat = motionquat[timestep,9,:]
+                yaw_motion_quat = yaw_quat(ref_motion_quat)
+                yaw_motion_matrix = np.zeros(9)
+                mujoco.mju_quat2Mat(yaw_motion_matrix, yaw_motion_quat)
+                yaw_motion_matrix = yaw_motion_matrix.reshape(3,3)
+                
+                robot_quat = d.xquat[body_id]
+                yaw_robot_quat = yaw_quat(robot_quat)
+                yaw_robot_matrix = np.zeros(9)
+                mujoco.mju_quat2Mat(yaw_robot_matrix, yaw_robot_quat)
+                yaw_robot_matrix = yaw_robot_matrix.reshape(3,3)
+                init_to_world =  yaw_robot_matrix @ yaw_motion_matrix.T
+
 
             mujoco.mj_step(m, d)
             tau = pd_control(target_dof_pos, d.qpos[7:], stiffness_array, np.zeros_like(damping_array), d.qvel[6:], damping_array)# xml
@@ -280,7 +341,7 @@ if __name__ == "__main__":
                 motioninput = np.concatenate((motioninputpos[timestep,:],motioninputvel[timestep,:]),axis=0)
                 motionposcurrent = motionpos[timestep,9,:]
                 motionquatcurrent = motionquat[timestep,9,:]
-                anchor_quat = subtract_frame_transforms_mujoco(position,quaternion,motionposcurrent,motionquatcurrent)[1]
+                anchor_quat = subtract_frame_transforms_mujoco(position,quaternion,motionposcurrent,motionquatcurrent,init_to_world)[1]
                 anchor_ori = np.zeros(9)
                 mujoco.mju_quat2Mat(anchor_ori, anchor_quat)
                 anchor_ori = anchor_ori.reshape(3, 3)[:, :2]
@@ -313,8 +374,9 @@ if __name__ == "__main__":
                 target_dof_pos = action * action_scale + joint_pos_array_seq
                 target_dof_pos = target_dof_pos.reshape(-1,)
                 target_dof_pos = np.array([target_dof_pos[joint_seq.index(joint)] for joint in joint_xml])
-                timestep+=1
-                
+                i += 1
+                if i > 0:# 1000
+                    timestep += 1
 
             # Pick up changes to the physics state, apply perturbations, update options from GUI.
             viewer.sync()
